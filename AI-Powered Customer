@@ -1,0 +1,729 @@
+# AI-Powered Customer Support Chatbot
+# Complete implementation with NLP, context awareness, and interaction logging
+
+import os
+import sqlite3
+import json
+import re
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+import logging
+
+# Web framework
+from flask import Flask, request, jsonify, render_template_string
+
+# NLP libraries
+import nltk
+from nltk.tokenize import word_tokenize, sent_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.tag import pos_tag
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet')
+
+try:
+    nltk.data.find('taggers/averaged_perceptron_tagger')
+except LookupError:
+    nltk.download('averaged_perceptron_tagger')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class DatabaseManager:
+    """Handles all database operations for the chatbot"""
+    
+    def __init__(self, db_path: str = "chatbot.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize the database with required tables"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Create conversations table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                user_message TEXT NOT NULL,
+                bot_response TEXT NOT NULL,
+                confidence_score REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                user_feedback INTEGER DEFAULT NULL
+            )
+        ''')
+        
+        # Create knowledge base table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS knowledge_base (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                keywords TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create user sessions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                session_id TEXT PRIMARY KEY,
+                context TEXT,
+                last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        
+        # Populate with sample data if empty
+        self.populate_sample_data()
+    
+    def populate_sample_data(self):
+        """Add sample FAQ data to the knowledge base"""
+        sample_data = [
+            ("General", "What are your business hours?", 
+             "Our business hours are Monday to Friday, 9 AM to 6 PM EST. We're closed on weekends and major holidays.", 
+             "hours,time,open,closed,schedule,business"),
+            
+            ("Billing", "How can I update my payment method?", 
+             "You can update your payment method by logging into your account, going to 'Billing Settings', and clicking 'Update Payment Method'. We accept all major credit cards and PayPal.", 
+             "payment,billing,credit,card,update,method"),
+            
+            ("Technical", "I'm having trouble logging in", 
+             "If you're having trouble logging in, try: 1) Check your username and password, 2) Clear your browser cache, 3) Try resetting your password, 4) Contact support if the issue persists.", 
+             "login,password,access,trouble,username,reset"),
+            
+            ("Shipping", "How long does shipping take?", 
+             "Standard shipping takes 3-5 business days. Express shipping takes 1-2 business days. International shipping takes 7-14 business days depending on location.", 
+             "shipping,delivery,time,fast,international,express"),
+            
+            ("Returns", "What is your return policy?", 
+             "We offer a 30-day return policy for most items. Items must be in original condition. To initiate a return, contact our support team or use the returns portal in your account.", 
+             "return,refund,policy,exchange,money,back"),
+            
+            ("Technical", "The website is loading slowly", 
+             "If the website is loading slowly, try: 1) Check your internet connection, 2) Clear browser cache and cookies, 3) Try a different browser, 4) Disable browser extensions temporarily.", 
+             "slow,loading,website,performance,browser,cache"),
+            
+            ("Account", "How do I delete my account?", 
+             "To delete your account, go to Account Settings > Privacy > Delete Account. Please note this action is permanent and cannot be undone. Contact support if you need assistance.", 
+             "delete,account,remove,permanent,privacy,settings")
+        ]
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Check if data already exists
+        cursor.execute("SELECT COUNT(*) FROM knowledge_base")
+        if cursor.fetchone()[0] == 0:
+            cursor.executemany(
+                "INSERT INTO knowledge_base (category, question, answer, keywords) VALUES (?, ?, ?, ?)",
+                sample_data
+            )
+            conn.commit()
+        
+        conn.close()
+    
+    def log_conversation(self, session_id: str, user_message: str, bot_response: str, confidence: float):
+        """Log a conversation exchange"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO conversations (session_id, user_message, bot_response, confidence_score) VALUES (?, ?, ?, ?)",
+            (session_id, user_message, bot_response, confidence)
+        )
+        conn.commit()
+        conn.close()
+    
+    def get_knowledge_base(self) -> List[Dict]:
+        """Retrieve all knowledge base entries"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT category, question, answer, keywords FROM knowledge_base")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [{"category": row[0], "question": row[1], "answer": row[2], "keywords": row[3]} 
+                for row in rows]
+    
+    def update_session_context(self, session_id: str, context: Dict):
+        """Update or create session context"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO user_sessions (session_id, context, last_interaction) VALUES (?, ?, ?)",
+            (session_id, json.dumps(context), datetime.now())
+        )
+        conn.commit()
+        conn.close()
+    
+    def get_session_context(self, session_id: str) -> Dict:
+        """Retrieve session context"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT context FROM user_sessions WHERE session_id = ?", (session_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return json.loads(row[0])
+        return {}
+
+class NLPProcessor:
+    """Handles natural language processing tasks"""
+    
+    def __init__(self):
+        self.lemmatizer = WordNetLemmatizer()
+        self.stop_words = set(stopwords.words('english'))
+        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+        self.knowledge_vectors = None
+        self.knowledge_base = []
+    
+    def preprocess_text(self, text: str) -> str:
+        """Clean and preprocess text"""
+        # Convert to lowercase
+        text = text.lower()
+        
+        # Remove special characters except spaces and basic punctuation
+        text = re.sub(r'[^a-zA-Z0-9\s\.\?\!]', '', text)
+        
+        # Tokenize
+        tokens = word_tokenize(text)
+        
+        # Remove stopwords and lemmatize
+        processed_tokens = []
+        for token in tokens:
+            if token not in self.stop_words and len(token) > 2:
+                processed_tokens.append(self.lemmatizer.lemmatize(token))
+        
+        return ' '.join(processed_tokens)
+    
+    def extract_intent(self, text: str) -> Dict:
+        """Extract intent from user message"""
+        text_lower = text.lower()
+        
+        # Simple intent classification based on keywords
+        intents = {
+            'greeting': ['hello', 'hi', 'hey', 'good morning', 'good afternoon'],
+            'question': ['what', 'how', 'when', 'where', 'why', 'which', '?'],
+            'problem': ['problem', 'issue', 'trouble', 'error', 'broken', 'not working'],
+            'request': ['please', 'can you', 'could you', 'would you', 'help me'],
+            'goodbye': ['bye', 'goodbye', 'see you', 'thanks', 'thank you']
+        }
+        
+        detected_intents = []
+        for intent, keywords in intents.items():
+            if any(keyword in text_lower for keyword in keywords):
+                detected_intents.append(intent)
+        
+        return {
+            'primary_intent': detected_intents[0] if detected_intents else 'unknown',
+            'all_intents': detected_intents,
+            'entities': self.extract_entities(text)
+        }
+    
+    def extract_entities(self, text: str) -> List[Dict]:
+        """Extract named entities from text"""
+        tokens = word_tokenize(text)
+        pos_tags = pos_tag(tokens)
+        
+        entities = []
+        for word, tag in pos_tags:
+            if tag in ['NN', 'NNP', 'NNS', 'NNPS']:  # Nouns
+                entities.append({'word': word, 'type': 'NOUN', 'tag': tag})
+        
+        return entities
+    
+    def train_vectorizer(self, knowledge_base: List[Dict]):
+        """Train the TF-IDF vectorizer on the knowledge base"""
+        self.knowledge_base = knowledge_base
+        
+        # Combine questions and keywords for better matching
+        texts = []
+        for item in knowledge_base:
+            combined_text = f"{item['question']} {item.get('keywords', '')}"
+            texts.append(self.preprocess_text(combined_text))
+        
+        if texts:
+            self.knowledge_vectors = self.vectorizer.fit_transform(texts)
+    
+    def find_best_match(self, user_input: str, threshold: float = 0.3) -> Tuple[Optional[Dict], float]:
+        """Find the best matching response from knowledge base"""
+        if not self.knowledge_vectors:
+            return None, 0.0
+        
+        # Preprocess user input
+        processed_input = self.preprocess_text(user_input)
+        
+        # Transform user input using the trained vectorizer
+        input_vector = self.vectorizer.transform([processed_input])
+        
+        # Calculate similarities
+        similarities = cosine_similarity(input_vector, self.knowledge_vectors)[0]
+        
+        # Find best match
+        best_match_idx = np.argmax(similarities)
+        best_similarity = similarities[best_match_idx]
+        
+        if best_similarity >= threshold:
+            return self.knowledge_base[best_match_idx], best_similarity
+        
+        return None, best_similarity
+
+class ContextManager:
+    """Manages conversation context and state"""
+    
+    def __init__(self):
+        self.session_contexts = {}
+    
+    def update_context(self, session_id: str, user_input: str, bot_response: str, intent: Dict):
+        """Update conversation context"""
+        if session_id not in self.session_contexts:
+            self.session_contexts[session_id] = {
+                'conversation_history': [],
+                'current_topic': None,
+                'user_preferences': {},
+                'last_intent': None
+            }
+        
+        context = self.session_contexts[session_id]
+        context['conversation_history'].append({
+            'user': user_input,
+            'bot': bot_response,
+            'timestamp': datetime.now().isoformat(),
+            'intent': intent
+        })
+        
+        # Keep only last 10 exchanges to manage memory
+        if len(context['conversation_history']) > 10:
+            context['conversation_history'] = context['conversation_history'][-10:]
+        
+        context['last_intent'] = intent['primary_intent']
+        
+        return context
+    
+    def get_context(self, session_id: str) -> Dict:
+        """Get current context for session"""
+        return self.session_contexts.get(session_id, {})
+
+class Chatbot:
+    """Main chatbot class that orchestrates all components"""
+    
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.nlp = NLPProcessor()
+        self.context_manager = ContextManager()
+        
+        # Initialize NLP with knowledge base
+        knowledge_base = self.db.get_knowledge_base()
+        self.nlp.train_vectorizer(knowledge_base)
+        
+        logger.info("Chatbot initialized successfully")
+    
+    def generate_response(self, user_input: str, session_id: str) -> Dict:
+        """Generate a response to user input"""
+        try:
+            # Extract intent and entities
+            intent_info = self.nlp.extract_intent(user_input)
+            
+            # Get current context
+            context = self.context_manager.get_context(session_id)
+            
+            # Handle different types of intents
+            if intent_info['primary_intent'] == 'greeting':
+                response = "Hello! I'm here to help you with any questions you might have. How can I assist you today?"
+                confidence = 0.9
+            
+            elif intent_info['primary_intent'] == 'goodbye':
+                response = "Thank you for chatting with me! Have a great day, and feel free to reach out if you need any help in the future."
+                confidence = 0.9
+            
+            else:
+                # Find best match from knowledge base
+                best_match, confidence = self.nlp.find_best_match(user_input)
+                
+                if best_match and confidence > 0.3:
+                    response = best_match['answer']
+                    
+                    # Add contextual information if available
+                    if context.get('last_intent') == 'problem' and intent_info['primary_intent'] == 'question':
+                        response += "\n\nIf this doesn't resolve your issue, please don't hesitate to contact our support team for further assistance."
+                
+                else:
+                    # Fallback response
+                    response = self.generate_fallback_response(user_input, intent_info)
+                    confidence = 0.2
+            
+            # Update context
+            self.context_manager.update_context(session_id, user_input, response, intent_info)
+            
+            # Log conversation
+            self.db.log_conversation(session_id, user_input, response, confidence)
+            
+            return {
+                'response': response,
+                'confidence': confidence,
+                'intent': intent_info,
+                'session_id': session_id
+            }
+        
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}")
+            return {
+                'response': "I apologize, but I'm experiencing some technical difficulties. Please try again in a moment or contact our support team if the issue persists.",
+                'confidence': 0.0,
+                'intent': {'primary_intent': 'error'},
+                'session_id': session_id
+            }
+    
+    def generate_fallback_response(self, user_input: str, intent_info: Dict) -> str:
+        """Generate fallback response when no good match is found"""
+        fallback_responses = [
+            "I'm not sure I understand your question completely. Could you please rephrase it or provide more details?",
+            "I don't have specific information about that topic in my knowledge base. Let me connect you with a human agent who can better assist you.",
+            "That's an interesting question! While I don't have a direct answer, I'd recommend checking our FAQ section or contacting our support team for detailed assistance.",
+            "I want to make sure I give you accurate information. Could you clarify what specific aspect you're asking about?"
+        ]
+        
+        # Choose response based on intent
+        if intent_info['primary_intent'] == 'problem':
+            return "I understand you're experiencing an issue. While I don't have specific information about this problem, I'd recommend contacting our technical support team who can provide specialized assistance."
+        
+        return fallback_responses[0]
+
+# Flask Web Application
+app = Flask(__name__)
+chatbot = Chatbot()
+
+# HTML template for the chat interface
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Customer Support Chatbot</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .chat-container {
+            width: 400px;
+            height: 600px;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .chat-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .chat-header h1 {
+            font-size: 1.2em;
+            font-weight: 600;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            background: #f8f9fa;
+        }
+        
+        .message {
+            margin-bottom: 15px;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .user-message {
+            align-self: flex-end;
+            background: #667eea;
+            color: white;
+            padding: 12px 16px;
+            border-radius: 18px 18px 4px 18px;
+            max-width: 80%;
+            word-wrap: break-word;
+        }
+        
+        .bot-message {
+            align-self: flex-start;
+            background: white;
+            color: #333;
+            padding: 12px 16px;
+            border-radius: 18px 18px 18px 4px;
+            max-width: 80%;
+            word-wrap: break-word;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        
+        .confidence-score {
+            font-size: 0.8em;
+            color: #666;
+            margin-top: 5px;
+            text-align: right;
+        }
+        
+        .chat-input {
+            padding: 20px;
+            background: white;
+            border-top: 1px solid #eee;
+        }
+        
+        .input-group {
+            display: flex;
+            gap: 10px;
+        }
+        
+        #messageInput {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #ddd;
+            border-radius: 25px;
+            outline: none;
+            font-size: 14px;
+        }
+        
+        #messageInput:focus {
+            border-color: #667eea;
+        }
+        
+        #sendButton {
+            padding: 12px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        
+        #sendButton:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        
+        .typing-indicator {
+            display: none;
+            padding: 10px;
+            font-style: italic;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h1>🤖 AI Customer Support</h1>
+            <p>How can I help you today?</p>
+        </div>
+        
+        <div class="chat-messages" id="chatMessages">
+            <div class="message">
+                <div class="bot-message">
+                    Hello! I'm your AI customer support assistant. I can help you with questions about our services, billing, technical issues, and more. What would you like to know?
+                </div>
+            </div>
+        </div>
+        
+        <div class="typing-indicator" id="typingIndicator">
+            Bot is typing...
+        </div>
+        
+        <div class="chat-input">
+            <div class="input-group">
+                <input type="text" id="messageInput" placeholder="Type your message..." />
+                <button id="sendButton">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chatMessages = document.getElementById('chatMessages');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const typingIndicator = document.getElementById('typingIndicator');
+        
+        let sessionId = 'session_' + Math.random().toString(36).substr(2, 9);
+        
+        function addMessage(message, isUser = false, confidence = null) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message';
+            
+            const messageContent = document.createElement('div');
+            messageContent.className = isUser ? 'user-message' : 'bot-message';
+            messageContent.textContent = message;
+            
+            messageDiv.appendChild(messageContent);
+            
+            if (!isUser && confidence !== null) {
+                const confidenceDiv = document.createElement('div');
+                confidenceDiv.className = 'confidence-score';
+                confidenceDiv.textContent = `Confidence: ${(confidence * 100).toFixed(1)}%`;
+                messageDiv.appendChild(confidenceDiv);
+            }
+            
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        function showTyping() {
+            typingIndicator.style.display = 'block';
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        function hideTyping() {
+            typingIndicator.style.display = 'none';
+        }
+        
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return;
+            
+            addMessage(message, true);
+            messageInput.value = '';
+            
+            showTyping();
+            
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        session_id: sessionId
+                    })
+                });
+                
+                const data = await response.json();
+                hideTyping();
+                
+                addMessage(data.response, false, data.confidence);
+            } catch (error) {
+                hideTyping();
+                addMessage('Sorry, I encountered an error. Please try again.', false);
+            }
+        }
+        
+        sendButton.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        // Focus input on load
+        messageInput.focus();
+    </script>
+</body>
+</html>
+'''
+
+@app.route('/')
+def index():
+    """Serve the chat interface"""
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Handle chat messages"""
+    try:
+        data = request.get_json()
+        user_message = data.get('message', '')
+        session_id = data.get('session_id', 'default')
+        
+        if not user_message:
+            return jsonify({'error': 'No message provided'}), 400
+        
+        # Generate response
+        result = chatbot.generate_response(user_message, session_id)
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        return jsonify({
+            'response': 'I apologize for the technical difficulty. Please try again.',
+            'confidence': 0.0,
+            'intent': {'primary_intent': 'error'}
+        }), 500
+
+@app.route('/analytics')
+def analytics():
+    """Simple analytics endpoint"""
+    try:
+        conn = sqlite3.connect(chatbot.db.db_path)
+        cursor = conn.cursor()
+        
+        # Get conversation statistics
+        cursor.execute("SELECT COUNT(*) FROM conversations")
+        total_conversations = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT AVG(confidence_score) FROM conversations")
+        avg_confidence = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT COUNT(DISTINCT session_id) FROM conversations")
+        unique_sessions = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return jsonify({
+            'total_conversations': total_conversations,
+            'average_confidence': round(avg_confidence, 3),
+            'unique_sessions': unique_sessions
+        })
+    
+    except Exception as e:
+        logger.error(f"Error in analytics endpoint: {str(e)}")
+        return jsonify({'error': 'Analytics data unavailable'}), 500
+
+if __name__ == '__main__':
+    print("🤖 Starting AI Customer Support Chatbot...")
+    print("📊 Database initialized with sample FAQ data")
+    print("🌐 Web interface available at: http://localhost:5000")
+    print("📈 Analytics available at: http://localhost:5000/analytics")
+    print("\nPress Ctrl+C to stop the server")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
